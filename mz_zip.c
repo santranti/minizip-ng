@@ -111,6 +111,7 @@ typedef struct mz_zip_s {
     uint8_t entry_scanned; /* entry header information read ok */
     uint8_t entry_opened;  /* entry is open for read/write */
     uint8_t entry_raw;     /* entry opened with raw mode */
+    uint8_t entry_eof;     /* entry read reached end of stream */
     uint32_t entry_crc32;  /* entry crc32  */
 
     uint64_t number_entry;
@@ -1914,6 +1915,7 @@ static int32_t mz_zip_entry_open_int(void *handle, uint8_t raw, int16_t compress
 
     if (err == MZ_OK) {
         zip->entry_opened = 1;
+        zip->entry_eof = 0;
         zip->entry_crc32 = 0;
     } else {
         mz_zip_entry_close_int(zip);
@@ -2107,6 +2109,11 @@ int32_t mz_zip_entry_read(void *handle, void *buf, int32_t len) {
     read = mz_stream_read(zip->compress_stream, buf, len);
     if (read > 0)
         zip->entry_crc32 = mz_crypt_crc32_update(zip->entry_crc32, buf, read);
+    /* Decoders can return their final bytes before a subsequent read returns zero. */
+    if ((read == 0) ||
+        ((read > 0) && (read < len) && !zip->entry_raw &&
+         (zip->file_info.compression_method != MZ_COMPRESS_METHOD_STORE)))
+        zip->entry_eof = 1;
 
     mz_zip_print("Zip - Entry - Read - %" PRId32 " (max %" PRId32 ")\n", read, len);
 
@@ -2130,7 +2137,12 @@ int32_t mz_zip_entry_write(void *handle, const void *buf, int32_t len) {
 int32_t mz_zip_entry_read_close(void *handle, uint32_t *crc32, int64_t *compressed_size, int64_t *uncompressed_size) {
     mz_zip *zip = (mz_zip *)handle;
     int64_t total_in = 0;
+    int64_t total_out = 0;
+    int64_t crypt_total_in = 0;
+    int64_t header_size = 0;
+    int64_t footer_size = 0;
     int32_t err = MZ_OK;
+    uint8_t fully_read = 0;
     uint8_t zip64 = 0;
 
     if (!zip || mz_zip_entry_is_open(zip) != MZ_OK)
@@ -2148,8 +2160,25 @@ int32_t mz_zip_entry_read_close(void *handle, uint32_t *crc32, int64_t *compress
         *uncompressed_size = zip->file_info.uncompressed_size;
 
     mz_stream_get_prop_int64(zip->compress_stream, MZ_STREAM_PROP_TOTAL_IN, &total_in);
+    mz_stream_get_prop_int64(zip->compress_stream, MZ_STREAM_PROP_TOTAL_OUT, &total_out);
+    if (mz_stream_get_prop_int64(zip->crypt_stream, MZ_STREAM_PROP_HEADER_SIZE, &header_size) == MZ_OK)
+        total_in += header_size;
+    if (mz_stream_get_prop_int64(zip->crypt_stream, MZ_STREAM_PROP_FOOTER_SIZE, &footer_size) == MZ_OK)
+        total_in += footer_size;
 
-    if ((zip->file_info.flag & MZ_ZIP_FLAG_DATA_DESCRIPTOR) &&
+    /* Decompressors can buffer input or reach EOF before consuming all encrypted data. */
+    if (zip->entry_raw || zip->file_info.compression_method == MZ_COMPRESS_METHOD_STORE)
+        fully_read = (total_in == zip->file_info.compressed_size);
+    if (!zip->entry_raw)
+        fully_read |= zip->entry_eof || (total_out >= zip->file_info.uncompressed_size);
+
+    if (zip->file_info.flag & MZ_ZIP_FLAG_ENCRYPTED) {
+        mz_stream_get_prop_int64(zip->crypt_stream, MZ_STREAM_PROP_TOTAL_IN, &crypt_total_in);
+        if (fully_read || (crypt_total_in + footer_size == zip->file_info.compressed_size))
+            err = mz_stream_close(zip->crypt_stream);
+    }
+
+    if ((err == MZ_OK) && (zip->file_info.flag & MZ_ZIP_FLAG_DATA_DESCRIPTOR) &&
         ((zip->file_info.flag & MZ_ZIP_FLAG_MASK_LOCAL_INFO) == 0) && (crc32 || compressed_size || uncompressed_size)) {
         /* Check to see if data descriptor is zip64 bit format or not */
         if (mz_zip_extrafield_contains(zip->local_file_info.extrafield, zip->local_file_info.extrafield_size,
@@ -2163,7 +2192,7 @@ int32_t mz_zip_entry_read_close(void *handle, uint32_t *crc32, int64_t *compress
         if (err == MZ_OK) {
             err = mz_stream_seek(zip->stream,
                                  MZ_ZIP_SIZE_LD_ITEM + (int64_t)zip->local_file_info.filename_size +
-                                     (int64_t)zip->local_file_info.extrafield_size + total_in,
+                                     (int64_t)zip->local_file_info.extrafield_size + zip->file_info.compressed_size,
                                  MZ_SEEK_CUR);
         }
 
@@ -2172,8 +2201,8 @@ int32_t mz_zip_entry_read_close(void *handle, uint32_t *crc32, int64_t *compress
             err = mz_zip_entry_read_descriptor(zip->stream, zip64, crc32, compressed_size, uncompressed_size);
     }
 
-    /* If entire entry was not read verification will fail */
-    if ((err == MZ_OK) && (total_in == zip->file_info.compressed_size) && (!zip->entry_raw)) {
+    /* Skip CRC verification for intentionally partial reads. */
+    if ((err == MZ_OK) && fully_read && (!zip->entry_raw)) {
 #ifdef HAVE_WZAES
         /* AES zip version AE-1 will expect a valid crc as well */
         if (zip->file_info.aes_version <= 0x0001)
